@@ -1,0 +1,12 @@
+Motor Driver TB6612fng
+16 array IR reflecter(pins 16 X 1 MUX)
+Main Brain ESP32
+2000 rpm/ 6V Motor
+7.4 LI/Polymar battery
+
+
+s0 - 19
+s1 - 21
+s2 - 22
+s3 - 23
+enb - 5
