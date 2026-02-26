@@ -2,7 +2,7 @@
 
 // =====================================================
 // 🧠 ESP32 LINE FOLLOWER — 16 SENSOR (MUX) + TB6612
-//     WITH SHARP TURN HANDLING
+//     WITH SHARP TURN + DEAD END HANDLING
 // =====================================================
 
 // ================= MOTOR PINS =================
@@ -30,23 +30,34 @@ int sensorMax[SENSOR_COUNT];
 int sensorThreshold[SENSOR_COUNT];
 
 // ================= SPEED =================
-#define MAX_SPEED      180   // Increased for better control authority
-#define BASE_SPEED     70
-#define TURN_SPEED     130   // Speed for sharp turn pivot
-#define MIN_SPEED     -180   // ✅ Allow reverse for pivoting
+#define MAX_SPEED      255
+#define BASE_SPEED     60
+#define TURN_SPEED     100
+#define U_SPEED        65 // 110
+#define MIN_SPEED     -255
 
 // ================= PID =================
-float Kp = 1.2;   // Increased — needs more aggression for sharp turns
+float Kp = 1.2;
 float Ki = 0.0001;
-float Kd = 1.2;   // Increased — dampens oscillation after turn
+float Kd = 1.2;
 
 int   lastError  = 0;
 float totalError = 0;
 
-// ================= SHARP TURN STATE =================
-// How many consecutive "line lost" loops before recovery spin
-#define LOST_THRESHOLD  8
+// ================= LOST LINE =================
+#define LOST_THRESHOLD 8
 int lostCount = 0;
+
+// ================= DEAD END =================
+#define DEAD_END_CONFIRM 15
+int deadEndCount = 0;
+bool deadEndMode = false;
+
+// ================= LOOP DETECTION =================
+#define LOOP_ERROR_THRESHOLD 700
+#define LOOP_CONFIRM_COUNT   5
+
+int loopCounter = 0;
 
 // =====================================================
 void selectMux(int channel)
@@ -106,28 +117,22 @@ int weights[16] = {
 };
 
 // =====================================================
-// 🔹 SHARP TURN DETECTION
-//    Returns: 0 = no sharp turn, -1 = sharp left, 1 = sharp right
-// =====================================================
 int detectSharpTurn()
 {
-  // Check if any sensor on the RIGHT extreme (sensors 12–15) is active
   bool rightExtreme = sensorValues[12] || sensorValues[13] ||
                       sensorValues[14] || sensorValues[15];
 
-  // Check if any sensor on the LEFT extreme (sensors 0–3) is active
   bool leftExtreme  = sensorValues[0] || sensorValues[1] ||
                       sensorValues[2] || sensorValues[3];
 
-  // Check that center sensors (4–11) are all off — confirms it's truly a sharp turn
   bool centerClear = true;
   for (int i = 4; i <= 11; i++)
     if (sensorValues[i]) { centerClear = false; break; }
 
-  if (centerClear && rightExtreme && !leftExtreme)  return  1;  // Sharp right
-  if (centerClear && leftExtreme  && !rightExtreme) return -1;  // Sharp left
+  if (centerClear && rightExtreme && !leftExtreme)  return  1;
+  if (centerClear && leftExtreme  && !rightExtreme) return -1;
 
-  return 0;  // Normal line
+  return 0;
 }
 
 // =====================================================
@@ -145,13 +150,14 @@ int readLine(int &activeCount)
     }
   }
 
-  if (activeCount == 0) return lastError;  // Line lost — return last known
+  // ALL BLACK → possible dead end
+  if (activeCount == SENSOR_COUNT) return 9999;
+
+  if (activeCount == 0) return lastError;
 
   return (int)(position / activeCount);
 }
 
-// =====================================================
-// 🔹 MOTOR CONTROL — supports negative values for reverse
 // =====================================================
 void setMotor(int left, int right)
 {
@@ -163,7 +169,7 @@ void setMotor(int left, int right)
   else           { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); }
   ledcWrite(PWMA, abs(left));
 
-  // RIGHT MOTOR (inverted)
+  // RIGHT MOTOR
   if (right >= 0) { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); }
   else            { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);  }
   ledcWrite(PWMB, abs(right));
@@ -196,75 +202,130 @@ void loop()
   int activeCount = 0;
   int error = readLine(activeCount);
 
-  // ─────────────────────────────────────────────────
-  // CASE 1: Line completely lost — recovery spin
-  // ─────────────────────────────────────────────────
+  // ================= LOOP DETECTION =================
+if (abs(error) > LOOP_ERROR_THRESHOLD && activeCount > 0)
+{
+  loopCounter++;
+}
+else
+{
+  loopCounter = 0;
+}
+
+// If stuck turning too long → escape
+if (loopCounter > LOOP_CONFIRM_COUNT)
+{
+  Serial.println("### LOOP DETECTED ###");
+
+  // Stop briefly
+  setMotor(0, 0);
+  delay(80);
+
+  // Reverse slightly
+  setMotor(-BASE_SPEED, -BASE_SPEED);
+  delay(250);
+
+  // Force strong opposite turn
+  if (error > 0)
+    setMotor(-TURN_SPEED, TURN_SPEED);
+  else
+    setMotor(TURN_SPEED, -TURN_SPEED);
+
+  delay(600);
+
+  loopCounter = 0;
+  totalError = 0;
+
+  return;
+}
+
+  // ================= LINE LOST RECOVERY =================
   if (activeCount == 0)
   {
     lostCount++;
 
     if (lostCount >= LOST_THRESHOLD)
     {
-      // Spin toward last known direction
       if (lastError > 0)
-        setMotor( TURN_SPEED, -TURN_SPEED);  // Spin right
+        setMotor(TURN_SPEED, -TURN_SPEED);
       else
-        setMotor(-TURN_SPEED,  TURN_SPEED);  // Spin left
+        setMotor(-TURN_SPEED, TURN_SPEED);
 
       delay(5);
-      return;  // Skip PID this loop
+      return;
     }
   }
   else
   {
-    lostCount = 0;  // Reset lost counter when line is found
+    lostCount = 0;
   }
 
-  // ─────────────────────────────────────────────────
-  // CASE 2: Sharp turn detected
-  // ─────────────────────────────────────────────────
+  // ================= SHARP TURN =================
   int sharpTurn = detectSharpTurn();
 
   if (sharpTurn != 0)
   {
-    // ✅ Full pivot — one wheel forward, one backward
-    if (sharpTurn == 1)  // Sharp RIGHT
-    {
-      setMotor( TURN_SPEED, -TURN_SPEED);
-      Serial.println(">>> SHARP RIGHT");
-    }
-    else                 // Sharp LEFT
-    {
-      setMotor(-TURN_SPEED,  TURN_SPEED);
-      Serial.println(">>> SHARP LEFT");
-    }
+    if (sharpTurn == 1)
+      setMotor(TURN_SPEED, -TURN_SPEED);
+    else
+      setMotor(-TURN_SPEED, TURN_SPEED);
 
-    // Reset PID state so it doesn't carry stale error into next straight
     totalError = 0;
-    lastError  = error;
-
+    lastError = error;
     delay(5);
-    return;  // Skip normal PID
+    return;
   }
 
-  // ─────────────────────────────────────────────────
-  // CASE 3: Normal PID following
-  // ─────────────────────────────────────────────────
+  // ================= DEAD END DETECTION =================
+  if (activeCount == 0 || error == 9999)
+  {
+    deadEndCount++;
+    if (deadEndCount >= DEAD_END_CONFIRM)
+      deadEndMode = true;
+  }
+  else
+  {
+    deadEndCount = 0;
+  }
+
+  // ================= DEAD END ACTION =================
+  if (deadEndMode)
+  {
+    Serial.println("### DEAD END ###");
+
+    setMotor(0, 0);
+    // delay(100);
+
+    // setMotor(-120, -120);
+    // delay(250);
+
+    // if (lastError < 0) // >
+      setMotor(U_SPEED, -U_SPEED);
+    // else
+      // setMotor(-U_SPEED, U_SPEED);
+
+    // delay(450);
+
+    deadEndMode = false;
+    deadEndCount = 0;
+    totalError = 0;
+    return;
+  }
+
+  // ================= NORMAL PID =================
   int derivative = error - lastError;
-  totalError    += error;
-  lastError      = error;
+  totalError += error;
+  lastError = error;
 
   float correction = (Kp * error) + (Ki * totalError) + (Kd * derivative);
 
   int leftSpeed  = BASE_SPEED - correction;
   int rightSpeed = BASE_SPEED + correction;
 
-  // ✅ Allow negative speeds for tight curves near sharp turns
   leftSpeed  = constrain(leftSpeed,  MIN_SPEED, MAX_SPEED);
   rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
 
   setMotor(leftSpeed, rightSpeed);
 
-  Serial.println(error);
   delay(5);
 }
